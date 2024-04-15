@@ -1,0 +1,103 @@
+pipeline {
+    agent any
+
+    tools {
+        gradle 'Gradle 8.7'
+    }
+
+    stages {
+        stage('Create build executable') {
+            steps {
+                sh 'chmod +x gradlew' // Make gradlew executable
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps () {
+              sh "./gradlew sonar"
+            }
+        }
+
+        stage('Running Unit tests') {
+            steps {
+                sh './gradlew test'  // Run tests
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -t simplecalculatorregistry.azurecr.io/calculator-api-staging:latest .'
+            }
+        }
+
+        stage('Push to Azure Container Registry') {
+            steps {
+                azureCLI commands: [
+                    [exportVariablesString: '', script: 'az acr login -n simpleCalculatorRegistry'],
+                    [exportVariablesString: '', script: 'docker push simplecalculatorregistry.azurecr.io/calculator-api-staging:latest']
+                ],
+                principalCredentialId: 'azure-jenkins-app-auth'
+            }
+        }
+
+        stage('Deploy to Azure Container Apps') {
+            steps {
+                azureCLI commands: [
+                    [exportVariablesString: '', script: 'az acr login -n simpleCalculatorRegistry'],
+                    [exportVariablesString: '', script: 'az webapp restart --name simple-calculator-api-staging --resource-group fusion-x'],
+                    [exportVariablesString: '', script: 'az webapp config container set --name simple-calculator-api-staging --resource-group fusion-x --docker-custom-image-name simplecalculatorregistry.azurecr.io/calculator-api-staging:latest']
+                ],
+                principalCredentialId: 'azure-jenkins-app-auth'
+            }
+        }
+
+        stage('Clean Workspace') {
+            steps {
+                // Clean up Docker image
+                sh 'docker rmi -f simplecalculatorregistry.azurecr.io/calculator-api-staging:latest'
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def pipelineStatus = currentBuild.currentResult == null ? 'RUNNING' : currentBuild.currentResult
+                def color = ''
+                switch (pipelineStatus) {
+                    case 'SUCCESS':
+                        color = '#36a64f' // Green
+                        break
+                    case 'FAILURE':
+                        color = '#ff0000' // Red
+                        break
+                    case 'ABORTED':
+                        color = '#bdbdbd' // Grey
+                        break
+                    default:
+                        color = '#ffbf00' // Yellow
+                        break
+                }
+
+                def slackMessage = """
+                    *CI/CD Pipeline Pipeline Status Update*
+                    *Job Name:* ${env.JOB_NAME}
+                    *Build Number:* ${env.BUILD_NUMBER}
+                    *Build URL:* ${env.BUILD_URL}
+                    *Status:* ${pipelineStatus}
+                """
+
+                def attachment = [
+                    color: color,
+                    fallback: "CI/CD Pipeline Pipeline Status Update - ${env.JOB_NAME} - ${pipelineStatus}",
+                    text: slackMessage
+                ]
+
+                slackSend channel: 'fx-stage' , attachments: [attachment], tokenCredentialId: 'slack-auth'
+            }
+        }
+        success {
+            build job: 'Automated API Test Jobs/staging-api-testing'
+        }
+    }
+}
